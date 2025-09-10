@@ -3,7 +3,7 @@
 //! This module wraps the existing trigram scoring system in the new
 //! trait-based architecture.
 
-use super::{StringScorer, ScoringResult};
+use super::{ScoringResult, StringScorer};
 use crate::language::ScriptType;
 use crate::model::TrigramModel;
 use crate::processing::{StringProcessor, StringScorer as LegacyStringScorer};
@@ -35,14 +35,11 @@ impl StringScorer for TrigramStringScorer {
     fn score_string(&self, text: &str) -> ScoringResult {
         // Use the existing processing and scoring logic
         let processed = StringProcessor::process_string(text, self.model.is_lowercase_model());
-        let (score, threshold) = self.legacy_scorer.score_string_with_model(&processed, &self.model);
-        
-        ScoringResult::new(
-            score,
-            threshold,
-            ScriptType::Latin,
-            "Trigram".to_string(),
-        )
+        let (score, threshold) = self
+            .legacy_scorer
+            .score_string_with_model(&processed, &self.model);
+
+        ScoringResult::new(score, threshold, ScriptType::Latin, "Trigram".to_string())
     }
 
     fn script_type(&self) -> ScriptType {
@@ -70,10 +67,10 @@ mod tests {
     fn test_trigram_scorer() {
         let model = create_test_model();
         let scorer = TrigramStringScorer::new(Arc::new(model));
-        
+
         assert_eq!(scorer.script_type(), ScriptType::Latin);
         assert_eq!(scorer.name(), "Trigram");
-        
+
         let result = scorer.score_string("the");
         assert_eq!(result.script_type, ScriptType::Latin);
         assert_eq!(result.scorer_name, "Trigram");
@@ -85,10 +82,10 @@ mod tests {
     fn test_trigram_scorer_with_real_text() {
         let model = create_test_model();
         let scorer = TrigramStringScorer::new(Arc::new(model));
-        
+
         let result1 = scorer.score_string("testing");
         let result2 = scorer.score_string("xyzabc");
-        
+
         // Results should be reasonable (though not necessarily valid without a proper model)
         assert!(result1.score < 0.0);
         assert!(result2.score < 0.0);
