@@ -21,16 +21,22 @@
 //! ```
 
 pub mod constants;
+pub mod encoding;
 pub mod error;
+pub mod language;
 pub mod model;
 pub mod processing;
+pub mod scoring;
 
 use std::path::Path;
 
 pub use constants::*;
+pub use encoding::{SupportedEncoding, MultiEncodingExtractor, EncodedString, MultiEncodingResult};
 pub use error::StrangerError;
+pub use language::{ScriptType, LanguageDetectionResult, LanguageDetector};
 pub use model::{TrigramModel, ModelParser};
 pub use processing::{StringProcessor, StringScorer};
+pub use scoring::{StringScorer as NewStringScorer, ScoringResult, ScoringFactory};
 
 /// Options for string analysis
 #[derive(Debug, Clone, Default)]
@@ -48,7 +54,7 @@ pub struct AnalysisOptions {
 pub struct StringAnalysisResult {
     /// The original string that was analyzed
     pub original_string: String,
-    /// The trigram score for this string
+    /// The score for this string
     pub score: f64,
     /// The threshold this string must exceed to be considered valid
     pub threshold: f64,
@@ -58,6 +64,10 @@ pub struct StringAnalysisResult {
     pub normalized_string: String,
     /// Optional file offset where this string was found (for binary analysis)
     pub offset: Option<usize>,
+    /// Detected script/language type
+    pub detected_script: Option<ScriptType>,
+    /// Name of the scorer used
+    pub scorer_name: Option<String>,
 }
 
 /// String extracted from binary data with its location
@@ -74,12 +84,19 @@ pub struct BinaryString {
 pub struct BinaryAnalysisOptions {
     /// Minimum string length to extract (default: 4)
     pub min_length: Option<usize>,
+    /// Encodings to use for string extraction (default: all supported)
+    pub encodings: Option<Vec<SupportedEncoding>>,
+    /// Languages/scripts to detect and score (default: auto-detect)
+    pub target_languages: Option<Vec<ScriptType>>,
+    /// Whether to use language-specific scoring (default: false for backwards compatibility)
+    pub use_language_scoring: bool,
 }
 
 /// Main analyzer for extracting and scoring strings
 pub struct StrangerStrings {
     model: Option<TrigramModel>,
     scorer: Option<StringScorer>,
+    scoring_factory: Option<ScoringFactory>,
 }
 
 impl StrangerStrings {
@@ -88,6 +105,7 @@ impl StrangerStrings {
         Self {
             model: None,
             scorer: None,
+            scoring_factory: None,
         }
     }
 
@@ -104,6 +122,7 @@ impl StrangerStrings {
         };
 
         self.scorer = Some(StringScorer::new(&model));
+        self.scoring_factory = Some(ScoringFactory::with_trigram_model(model.clone()));
         self.model = Some(model);
         Ok(())
     }
@@ -119,6 +138,40 @@ impl StrangerStrings {
         candidate_string: &str,
         offset: Option<usize>,
     ) -> Result<StringAnalysisResult, StrangerError> {
+        self.analyze_string_with_options(candidate_string, offset, false, None)
+    }
+
+    /// Analyze a single string with language detection options
+    pub fn analyze_string_with_options(
+        &self,
+        candidate_string: &str,
+        offset: Option<usize>,
+        use_language_scoring: bool,
+        target_script: Option<ScriptType>,
+    ) -> Result<StringAnalysisResult, StrangerError> {
+        // If language scoring is requested and we have a scoring factory
+        if use_language_scoring {
+            if let Some(factory) = &self.scoring_factory {
+                let scoring_result = if let Some(script) = target_script {
+                    factory.score_string_with_script(candidate_string, script)?
+                } else {
+                    factory.score_string(candidate_string)?
+                };
+
+                return Ok(StringAnalysisResult {
+                    original_string: candidate_string.to_string(),
+                    score: scoring_result.score,
+                    threshold: scoring_result.threshold,
+                    is_valid: scoring_result.is_valid,
+                    normalized_string: candidate_string.to_string(),
+                    offset,
+                    detected_script: Some(scoring_result.script_type),
+                    scorer_name: Some(scoring_result.scorer_name),
+                });
+            }
+        }
+
+        // Fall back to traditional trigram scoring
         let model = self.model.as_ref().ok_or(StrangerError::ModelNotLoaded)?;
         let scorer = self.scorer.as_ref().ok_or(StrangerError::ModelNotLoaded)?;
 
@@ -132,6 +185,8 @@ impl StrangerStrings {
             is_valid: score > threshold,
             normalized_string: processed.scored_string,
             offset,
+            detected_script: None,
+            scorer_name: None,
         })
     }
 
@@ -198,15 +253,73 @@ impl StrangerStrings {
         options: &BinaryAnalysisOptions,
     ) -> Result<Vec<StringAnalysisResult>, StrangerError> {
         let min_length = options.min_length.unwrap_or(4);
-        let candidate_strings = self.extract_strings_from_binary(buffer, min_length);
+        let encodings = options.encodings.clone().unwrap_or_else(|| vec![SupportedEncoding::Ascii]);
+        
+        let extractor = MultiEncodingExtractor::new(encodings, min_length);
+        let multi_result = extractor.extract_strings(buffer);
 
         let mut results = Vec::new();
-        for binary_string in candidate_strings {
-            let result = self.analyze_string_with_offset(&binary_string.string, Some(binary_string.offset))?;
+        for encoded_string in multi_result.strings {
+            let result = self.analyze_string_with_options(
+                &encoded_string.string, 
+                Some(encoded_string.offset),
+                options.use_language_scoring,
+                None // Auto-detect language
+            )?;
             results.push(result);
         }
 
         Ok(results)
+    }
+
+    /// Analyze strings extracted from binary data with multi-encoding support
+    pub fn analyze_binary_file_multi_encoding(
+        &self,
+        buffer: &[u8],
+        options: &BinaryAnalysisOptions,
+    ) -> Result<Vec<(StringAnalysisResult, SupportedEncoding)>, StrangerError> {
+        let min_length = options.min_length.unwrap_or(4);
+        let encodings = options.encodings.clone().unwrap_or_else(SupportedEncoding::all);
+        
+        let extractor = MultiEncodingExtractor::new(encodings, min_length);
+        let multi_result = extractor.extract_strings(buffer);
+
+        let mut results = Vec::new();
+        for encoded_string in multi_result.strings {
+            let result = self.analyze_string_with_options(
+                &encoded_string.string, 
+                Some(encoded_string.offset),
+                options.use_language_scoring,
+                None // Auto-detect language
+            )?;
+            results.push((result, encoded_string.encoding));
+        }
+
+        Ok(results)
+    }
+
+    /// Enable language detection and scoring (without requiring a trigram model)
+    pub fn enable_language_detection(&mut self) -> Result<(), StrangerError> {
+        if self.scoring_factory.is_none() {
+            self.scoring_factory = Some(ScoringFactory::new());
+        }
+        Ok(())
+    }
+
+    /// Detect the language of a string
+    pub fn detect_language(&self, text: &str) -> Result<LanguageDetectionResult, StrangerError> {
+        if let Some(factory) = &self.scoring_factory {
+            Ok(factory.detect_language(text))
+        } else {
+            // Create temporary factory for detection
+            let factory = ScoringFactory::new();
+            Ok(factory.detect_language(text))
+        }
+    }
+
+    /// Check if language detection is available
+    pub fn has_language_detection(&self) -> bool {
+        self.scoring_factory.is_some()
     }
 }
 

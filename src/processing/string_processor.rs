@@ -1,4 +1,3 @@
-use regex::Regex;
 
 /// Processed string data for scoring
 #[derive(Debug, Clone, PartialEq)]
@@ -55,17 +54,33 @@ impl StringProcessor {
 
     /// Normalize spaces and tabs according to the algorithm
     fn normalize_spaces(s: &str) -> String {
-        let mut normalized = s.trim().to_string();
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return String::new();
+        }
 
-        // Collapse consecutive spaces into 1 space
-        let space_regex = Regex::new(r" {2,}").unwrap();
-        normalized = space_regex.replace_all(&normalized, " ").to_string();
-
-        // Collapse consecutive tabs into 1 tab
-        let tab_regex = Regex::new(r"\t{2,}").unwrap();
-        normalized = tab_regex.replace_all(&normalized, "\t").to_string();
-
-        normalized
+        let mut result = String::with_capacity(trimmed.len());
+        let mut chars = trimmed.chars().peekable();
+        
+        while let Some(ch) = chars.next() {
+            if ch == ' ' {
+                // Add one space and skip any consecutive spaces
+                result.push(' ');
+                while chars.peek() == Some(&' ') {
+                    chars.next();
+                }
+            } else if ch == '\t' {
+                // Add one tab and skip any consecutive tabs
+                result.push('\t');
+                while chars.peek() == Some(&'\t') {
+                    chars.next();
+                }
+            } else {
+                result.push(ch);
+            }
+        }
+        
+        result
     }
 
     /// Convert string to ASCII codes
@@ -148,6 +163,36 @@ mod tests {
     fn test_tabs_and_spaces_mixed() {
         let result = StringProcessor::process_string("\t  hello \t world \t ", false);
         assert_eq!(result.scored_string, "hello \t world"); // Leading/trailing removed, internal normalized
+    }
+
+    #[test]
+    fn test_ascii_normalization_for_garbage_prevention() {
+        // Test the specific case identified: non-ASCII chars get replaced with spaces
+        // This is what allows garbage strings to pass trigram scoring
+        
+        // Simulate a garbage string like "UNCeñÉ¹ð" that would be extracted from Latin-1
+        let garbage_input = "UNCeñÉ¹ð";
+        let result = StringProcessor::process_string(garbage_input, false);
+        
+        // After processing, non-ASCII chars should be replaced with spaces
+        // and then normalized, leaving just "UNCe" which looks like valid English
+        assert_eq!(result.original_string, "UNCeñÉ¹ð");
+        assert_eq!(result.scored_string, "UNCe"); // Non-ASCII replaced with spaces, then normalized
+        
+        // This demonstrates why we need garbage filtering BEFORE this processing step!
+        // The trigram model will see "UNCe" and think it's valid English
+    }
+    
+    #[test]
+    fn test_legitimate_non_ascii_normalization() {
+        // Test that legitimate text with some non-ASCII chars gets processed reasonably
+        let legitimate = "café menu";
+        let result = StringProcessor::process_string(legitimate, false);
+        
+        assert_eq!(result.original_string, "café menu");
+        assert_eq!(result.scored_string, "caf menu"); // é becomes space, then normalized
+        
+        // After normalization: "caf menu" - still recognizable
     }
 
     #[test]

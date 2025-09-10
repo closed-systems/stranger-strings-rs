@@ -6,7 +6,7 @@ use std::path::Path;
 
 use stranger_strings_rs::{
     get_threshold_for_length, AnalysisOptions, BinaryAnalysisOptions, StrangerError,
-    StrangerStrings, StringAnalysisResult, MAX_NG_THRESHOLD, NG_THRESHOLDS,
+    StrangerStrings, StringAnalysisResult, SupportedEncoding, ScriptType, MAX_NG_THRESHOLD, NG_THRESHOLDS,
 };
 
 #[derive(Debug, Clone)]
@@ -20,6 +20,9 @@ struct CliOptions {
     sort: String,
     info: bool,
     test: bool,
+    encodings: Vec<SupportedEncoding>,
+    languages: Option<Vec<ScriptType>>,
+    use_language_detection: bool,
 }
 
 impl Default for CliOptions {
@@ -34,12 +37,23 @@ impl Default for CliOptions {
             sort: "score".to_string(),
             info: false,
             test: false,
+            encodings: vec![SupportedEncoding::Ascii], // Default to ASCII for backward compatibility
+            languages: None,
+            use_language_detection: false,
         }
     }
 }
 
 fn main() {
     env_logger::init();
+
+    if let Err(e) = run_main() {
+        error!("Error: {}", e);
+        std::process::exit(1);
+    }
+}
+
+fn run_main() -> Result<(), StrangerError> {
 
     let matches = Command::new("stranger-strings")
         .about("Extract and analyze meaningful strings from binary files using trigram scoring")
@@ -96,8 +110,31 @@ fn main() {
             .long("test")
             .help("Run with sample test strings")
             .action(ArgAction::SetTrue))
+        .arg(Arg::new("encoding")
+            .short('e')
+            .long("encoding")
+            .value_name("ENCODINGS")
+            .help("Character encodings to use for string extraction (comma-separated). Available: ascii, utf8, utf16le, utf16be, latin1, latin9, all")
+            .default_value("ascii"))
+        .arg(Arg::new("language")
+            .short('L')
+            .long("language")
+            .value_name("LANGUAGES")
+            .help("Languages/scripts to detect and score (comma-separated). Available: latin, chinese, arabic, russian, all, auto"))
+        .arg(Arg::new("auto-detect")
+            .long("auto-detect")
+            .help("Enable automatic language detection and use language-specific scoring")
+            .action(ArgAction::SetTrue))
         .get_matches();
 
+    let encodings = parse_encodings(matches.get_one::<String>("encoding").unwrap())?;
+    let languages = if let Some(lang_str) = matches.get_one::<String>("language") {
+        Some(parse_languages(lang_str)?)
+    } else {
+        None
+    };
+    let use_language_detection = matches.get_flag("auto-detect") || languages.is_some();
+    
     let options = CliOptions {
         model: matches.get_one::<String>("model").unwrap().clone(),
         verbose: matches.get_flag("verbose"),
@@ -112,6 +149,9 @@ fn main() {
         sort: matches.get_one::<String>("sort").unwrap().clone(),
         info: matches.get_flag("info"),
         test: matches.get_flag("test"),
+        encodings,
+        languages,
+        use_language_detection,
     };
 
     let result = if options.info {
@@ -125,17 +165,73 @@ fn main() {
         std::process::exit(1);
     };
 
-    if let Err(e) = result {
-        error!("Error: {}", e);
-        std::process::exit(1);
+    result
+}
+
+fn parse_encodings(encoding_str: &str) -> Result<Vec<SupportedEncoding>, StrangerError> {
+    if encoding_str.to_lowercase() == "all" {
+        return Ok(SupportedEncoding::all());
     }
+    
+    let mut encodings = Vec::new();
+    for part in encoding_str.split(',') {
+        let trimmed = part.trim();
+        let encoding = SupportedEncoding::from_str(trimmed)?;
+        encodings.push(encoding);
+    }
+    
+    if encodings.is_empty() {
+        encodings.push(SupportedEncoding::Ascii);
+    }
+    
+    Ok(encodings)
+}
+
+fn parse_languages(language_str: &str) -> Result<Vec<ScriptType>, StrangerError> {
+    let lower_str = language_str.to_lowercase();
+    
+    if lower_str == "all" {
+        return Ok(ScriptType::all());
+    }
+    
+    if lower_str == "auto" {
+        // Return empty vec to indicate auto-detection
+        return Ok(vec![]);
+    }
+    
+    let mut languages = Vec::new();
+    for part in language_str.split(',') {
+        let trimmed = part.trim();
+        let language = ScriptType::from_str(trimmed)
+            .ok_or_else(|| StrangerError::InvalidInput(format!("Unknown language/script: {}", trimmed)))?;
+        languages.push(language);
+    }
+    
+    if languages.is_empty() {
+        languages.push(ScriptType::Latin);
+    }
+    
+    Ok(languages)
 }
 
 fn analyze_command(input: &str, options: &CliOptions) -> Result<(), StrangerError> {
     let mut analyzer = StrangerStrings::new();
 
-    // Load model
-    if !Path::new(&options.model).exists() {
+    // Load model or enable language detection
+    if Path::new(&options.model).exists() {
+        if options.verbose {
+            eprintln!("Loading model: {}", options.model);
+        }
+        analyzer.load_model(&AnalysisOptions {
+            model_path: Some(options.model.clone()),
+            ..Default::default()
+        })?;
+    } else if options.use_language_detection {
+        if options.verbose {
+            eprintln!("Enabling language detection (no model file found)");
+        }
+        analyzer.enable_language_detection()?;
+    } else {
         return Err(StrangerError::InvalidInput(format!(
             "Model file not found: {}",
             options.model
@@ -143,17 +239,11 @@ fn analyze_command(input: &str, options: &CliOptions) -> Result<(), StrangerErro
     }
 
     if options.verbose {
-        eprintln!("Loading model: {}", options.model);
-    }
-
-    analyzer.load_model(&AnalysisOptions {
-        model_path: Some(options.model.clone()),
-        ..Default::default()
-    })?;
-
-    if options.verbose {
-        let (model_type, is_lowercase) = analyzer.get_model_info()?;
-        eprintln!("Model type: {}, Lowercase: {}", model_type, is_lowercase);
+        if let Ok((model_type, is_lowercase)) = analyzer.get_model_info() {
+            eprintln!("Model type: {}, Lowercase: {}", model_type, is_lowercase);
+        } else if options.use_language_detection {
+            eprintln!("Using language detection mode");
+        }
     }
 
     let results: Vec<StringAnalysisResult>;
@@ -205,6 +295,9 @@ fn analyze_command(input: &str, options: &CliOptions) -> Result<(), StrangerErro
             &buffer,
             &BinaryAnalysisOptions {
                 min_length: Some(options.min_length),
+                encodings: Some(options.encodings.clone()),
+                target_languages: options.languages.clone(),
+                use_language_scoring: options.use_language_detection,
             },
         )?;
         is_binary_file = true;
